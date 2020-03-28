@@ -157,16 +157,16 @@ bool alwaysRaisesException(Block* block) {
 bool isAddScalar(Node* n) {
   return (n->kind() == Symbol::aten("add") ||
           n->kind() == Symbol::aten("add_")) &&
-    n->input(0)->type()->isSubtypeOf(TensorType::get()) &&
-    n->input(1)->type()->isSubtypeOf(NumberType::get());
+      n->input(0)->type()->isSubtypeOf(TensorType::get()) &&
+      n->input(1)->type()->isSubtypeOf(NumberType::get());
 }
 
-// If the op doesn't require observation, return
-// the the list of input `Value`s that we should check to see
-// if they are observed/quantized, if so, we can say the output
-// of this op is observed/quantized as well, since for these ops we can derive
-// the quantization parameters for output given inputs
-std::vector<Value*> getGeneralOpTensorInputs(Node* n) {
+// For a given value `v`, get the list of values that we need to check
+// if they are observed/quantized or not, if so, we can say the
+// `v` is also observed/quantized, since we can derive
+// the quantization parameters for `v` given the list of values
+std::vector<Value*> getPassThroughInputs(Value* v) {
+  Node* n = v->node();
   std::vector<std::string> single_input_aten_funcs = {
       "max_pool2d",
       "avg_pool2d",
@@ -551,10 +551,10 @@ class InsertObserversHelper {
       bool is_user_defined_function = false);
 
   void recordObserved(
-    Value* v,
-    Module observer_module,
-    std::unordered_map<Value*, Module>& values_to_observe,
-    std::unordered_set<Value*>& block_observed_values);
+      Value* v,
+      Module observer_module,
+      std::unordered_map<Value*, Module>& values_to_observe,
+      std::unordered_set<Value*>& block_observed_values);
 
   ModuleMethodVector getInvokedMethods(
       Module& module,
@@ -592,9 +592,7 @@ class InsertObserversHelper {
       Value* output,
       std::unordered_set<Value*>& block_observed_values);
 
-  void delayObservingValuesInPattern(
-      Graph& graph,
-      const PatternInfo& pattern);
+  void delayObservingValuesInPattern(Graph& graph, const PatternInfo& pattern);
 
   void addValuesToDelayObservation(
       const Module& module,
@@ -679,12 +677,13 @@ graph(%self, %a, %b, %inplace):
      %second_output = prim::CallFunction(%relu, %first_output, %inplace)
      return (%second_output) )");
 
-  const std::vector<std::reference_wrapper<const PatternInfo>> delay_patterns = {
-      conv_functional_relu,
-      conv_relu,
-      matmul_add,
-      add_module_relu,
-      add_functional_relu,
+  const std::vector<std::reference_wrapper<const PatternInfo>> delay_patterns =
+      {
+          conv_functional_relu,
+          conv_relu,
+          matmul_add,
+          add_module_relu,
+          add_functional_relu,
   };
 };
 
@@ -845,10 +844,11 @@ void InsertObserversHelper::delayObservingValuesInPattern(
   for (const auto& match : matches) {
     auto first_output = match.values_map.at(vmap.at("first_output"));
     auto second_output = match.values_map.at(vmap.at("second_output"));
-    GRAPH_DEBUG("Delay observation for value in function pattern:",
-                first_output->debugName(),
-                " to ",
-                second_output->debugName());
+    GRAPH_DEBUG(
+        "Delay observation for value in function pattern:",
+        first_output->debugName(),
+        " to ",
+        second_output->debugName());
     delay_observation_map_[first_output] = second_output;
   }
 }
@@ -876,9 +876,8 @@ void InsertObserversHelper::fillPassThroughValueMap(
         auto g = getCallFunctionGraph(n);
         blocks_to_visit.push(g->block());
       }
-      auto inputs = getGeneralOpTensorInputs(n);
-      for (auto* input : inputs) {
-        for (auto* output : n->outputs()) {
+      for (auto* output : n->outputs()) {
+        for (auto* input : getPassThroughInputs(output)) {
           pass_through_value_map_[output].push_back(input);
         }
       }
@@ -983,8 +982,7 @@ bool InsertObserversHelper::valueNeedsToBeQuantized(Value* v) {
   // of the quantizable function.
   if (!is_dynamic) {
     // Check whether producer is quantizable
-    if (mayRequireObservation(v) &&
-        nodeQuantizable(v->node())) {
+    if (mayRequireObservation(v) && nodeQuantizable(v->node())) {
       return true;
     }
   }
@@ -1162,7 +1160,8 @@ InsertObserversHelper::insertObserversFor(
   for (auto* v : block->inputs()) {
     if (!inputs_outputs.count(v) && !values_to_observe.count(v)) {
       if (auto observer_opt = getObserverFor(v)) {
-        recordObserved(v, *observer_opt, values_to_observe, block_observed_values);
+        recordObserved(
+            v, *observer_opt, values_to_observe, block_observed_values);
       }
     }
   }
@@ -1209,15 +1208,21 @@ InsertObserversHelper::insertObserversFor(
           auto* node_input = n->input(i + input_offset);
           if (input_observers[i] && !inputs_outputs.count(node_input) &&
               !isObserved(node_input, block_observed_values)) {
-            recordObserved(node_input, *input_observers[i],
-                           values_to_observe, block_observed_values);
+            recordObserved(
+                node_input,
+                *input_observers[i],
+                values_to_observe,
+                block_observed_values);
           }
         }
         for (auto i = 0U; i < n->outputs().size(); ++i) {
           if (output_observers[i] && !inputs_outputs.count(n->output(i)) &&
               !isObserved(n->output(i), block_observed_values)) {
-            recordObserved(n->output(i), *output_observers[i],
-                           values_to_observe, block_observed_values);
+            recordObserved(
+                n->output(i),
+                *output_observers[i],
+                values_to_observe,
+                block_observed_values);
           }
         }
       } else if (n->kind() == prim::If) {
@@ -1254,8 +1259,11 @@ InsertObserversHelper::insertObserversFor(
               if (output_observers[i] && !inputs_outputs.count(n->output(i)) &&
                   !block_observed_values.count(n->output(i)) &&
                   !observed_values_.count(n->output(i))) {
-                recordObserved(n->output(i), *output_observers[i],
-                               values_to_observe, block_observed_values);
+                recordObserved(
+                    n->output(i),
+                    *output_observers[i],
+                    values_to_observe,
+                    block_observed_values);
               }
             }
             aggregated_output_observers = output_observers;
@@ -1267,7 +1275,8 @@ InsertObserversHelper::insertObserversFor(
           if (!inputs_outputs.count(v) &&
               !isObserved(v, block_observed_values)) {
             if (auto observer_opt = getObserverFor(v)) {
-              recordObserved(v, *observer_opt, values_to_observe, block_observed_values);
+              recordObserved(
+                  v, *observer_opt, values_to_observe, block_observed_values);
             }
           }
         }
@@ -1288,9 +1297,10 @@ InsertObserversHelper::insertObserversFor(
     for (const auto& item : values_to_observe) {
       auto* v = item.first;
       auto observer = item.second;
-      TORCH_CHECK(!is_user_defined_function,
-                  "Inserting observers for user defined functions is not "
-                  "supported right now");
+      TORCH_CHECK(
+          !is_user_defined_function,
+          "Inserting observers for user defined functions is not "
+          "supported right now");
       insertObserverFor(v, module, observer, observer_name_and_modules);
     }
     block_observer_map_[block] = observer_name_and_modules;
@@ -1833,8 +1843,7 @@ graph(%a_dequant, %w_quant, %b, %stride, %padding, %dilation, %groups):
 
   std::vector<std::vector<std::string>> patterns_and_replacements = {
       {conv2d_with_quant, conv2d_with_quant_prepack},
-      {conv3d_with_quant, conv3d_with_quant_prepack}
-  };
+      {conv3d_with_quant, conv3d_with_quant_prepack}};
   for (const auto& item : patterns_and_replacements) {
     SubgraphRewriter rewriter;
     const auto& pattern = item[0];
@@ -2331,33 +2340,33 @@ void swapDeQuant(Block* block) {
         continue;
       }
     }
-    auto inputs = getGeneralOpTensorInputs(n);
-    if (inputs.size() > 0) {
-      bool is_dequantized = true;
-      for (auto* input : inputs) {
-        // note that we don't need to recursively check for prim::If
-        // here because if all inputs of a prim::If is dequantized
-        // the dequantize will be factored out before we get to this
-        // point
-        is_dequantized &= input->node()->kind() == Symbol::aten("dequantize");
-      }
-      if (!is_dequantized) {
-        continue;
-      }
-      // Delete dequantize node, we have one dequantize
-      // for each use of the value
-      for (auto* dequantized_val : inputs) {
-        auto* dequantize_node = dequantized_val->node();
-        TORCH_INTERNAL_ASSERT(
-            dequantized_val->uses().size() == 1,
-            "Expect to have one dequantize node for each use");
-        // Replace useses of dequantized_val with the input of
-        // dequantize node
-        dequantized_val->replaceAllUsesWith(dequantize_node->inputs()[0]);
-        dequantize_node->removeAllInputs();
-        dequantize_node->destroy();
-      }
-      for (auto* output : n->outputs()) {
+    for (auto* output : n->outputs()) {
+      auto inputs = getPassThroughInputs(output);
+      if (inputs.size() > 0) {
+        bool is_dequantized = true;
+        for (auto* input : inputs) {
+          // note that we don't need to recursively check for prim::If
+          // here because if all inputs of a prim::If is dequantized
+          // the dequantize will be factored out before we get to this
+          // point
+          is_dequantized &= input->node()->kind() == Symbol::aten("dequantize");
+        }
+        if (!is_dequantized) {
+          continue;
+        }
+        // Delete dequantize node, we have one dequantize
+        // for each use of the value
+        for (auto* dequantized_val : inputs) {
+          auto* dequantize_node = dequantized_val->node();
+          TORCH_INTERNAL_ASSERT(
+              dequantized_val->uses().size() == 1,
+              "Expect to have one dequantize node for each use");
+          // Replace useses of dequantized_val with the input of
+          // dequantize node
+          dequantized_val->replaceAllUsesWith(dequantize_node->inputs()[0]);
+          dequantize_node->removeAllInputs();
+          dequantize_node->destroy();
+        }
         std::vector<Use> uses = output->uses();
         // Insert new dequantize node for each use of the output
         insertDeQuantCall(graph, output, output, uses);
