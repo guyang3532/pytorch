@@ -4,6 +4,7 @@ import inspect
 import math
 import random
 import re
+import time
 import copy
 import torch
 import torch.cuda
@@ -17126,7 +17127,6 @@ scipy_lobpcg  | {:10.2e}  | {:10.2e}  | {:6} | N/A
             self.assertRaises(RuntimeError, lambda: torch.bmm(b1.cuda(), b2))
 
     @onlyCUDA
-    @unittest.skipIf(IS_WINDOWS, "Test is broken on Windows. See https://github.com/pytorch/pytorch/issues/42501")
     @wrapDeterministicFlagAPITest
     def test_cublas_config_deterministic_error(self, device):
         test_cases = [
@@ -17188,6 +17188,7 @@ fn(*args)
         # Wait for each process to finish and check for correct error behavior
         for p, fn_name, config, should_throw_error in processes:
             _, error = p.communicate()
+            time.sleep(0.001)
             if error:
                 error_message = error.decode("utf-8")
                 self.assertTrue(
